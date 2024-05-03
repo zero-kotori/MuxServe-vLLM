@@ -53,6 +53,7 @@ class ModelConfig:
     def __init__(
         self,
         model: str,
+        model_name: str,
         tokenizer: str,
         tokenizer_mode: str,
         trust_remote_code: bool,
@@ -64,8 +65,11 @@ class ModelConfig:
         tokenizer_revision: Optional[str] = None,
         max_model_len: Optional[int] = None,
         quantization: Optional[str] = None,
+        mps_percentage: int = 100,
+        flexstore_port: Optional[str] = None
     ) -> None:
         self.model = model
+        self.model_name = model_name
         self.tokenizer = tokenizer
         self.tokenizer_mode = tokenizer_mode
         self.trust_remote_code = trust_remote_code
@@ -75,6 +79,8 @@ class ModelConfig:
         self.revision = revision
         self.tokenizer_revision = tokenizer_revision
         self.quantization = quantization
+        self.mps_percentage = mps_percentage
+        self.flexstore_port = flexstore_port
 
         self.hf_config = get_config(model, trust_remote_code, revision)
         self.dtype = _get_and_verify_dtype(self.hf_config, dtype)
@@ -170,8 +176,12 @@ class ModelConfig:
         return total_num_attention_heads // parallel_config.tensor_parallel_size
 
     def get_num_layers(self, parallel_config: "ParallelConfig") -> int:
+        from muxserve.flexserver.pipeworker import PipeWorker
         total_num_hidden_layers = self.hf_config.num_hidden_layers
-        return total_num_hidden_layers // parallel_config.pipeline_parallel_size
+        partition = PipeWorker.pipeline_split(
+                total_num_hidden_layers,
+                parallel_config.pipeline_parallel_size)
+        return max(partition)
 
 
 class CacheConfig:
@@ -242,15 +252,17 @@ class ParallelConfig:
         pipeline_parallel_size: int,
         tensor_parallel_size: int,
         worker_use_ray: bool,
+        ray_address: Optional[str] = None,
     ) -> None:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
         self.worker_use_ray = worker_use_ray
+        self.ray_address = ray_address
 
         self.world_size = pipeline_parallel_size * tensor_parallel_size
         if self.world_size > 1:
             self.worker_use_ray = True
-        self._verify_args()
+        # self._verify_args()
 
     def _verify_args(self) -> None:
         if self.pipeline_parallel_size > 1:

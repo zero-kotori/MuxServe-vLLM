@@ -1,5 +1,5 @@
 """Token blocks."""
-from typing import List
+from typing import List, Dict, Any
 
 from vllm.utils import Device
 
@@ -66,3 +66,11 @@ class PhysicalTokenBlock:
         return (f'PhysicalTokenBlock(device={self.device}, '
                 f'block_number={self.block_number}, '
                 f'ref_count={self.ref_count})')
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "device": self.device,
+            "block_number": self.block_number,
+            "block_size": self.block_size,
+            "ref_count": self.ref_count,
+        }

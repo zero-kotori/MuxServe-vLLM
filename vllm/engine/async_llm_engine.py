@@ -1,8 +1,12 @@
+import os
 import asyncio
 import time
 from functools import partial
 from typing import (Any, Dict, Iterable, List, Optional, Set, Tuple, Type,
                     Union)
+
+from muxserve.constants import SM_HOLD_NAME_FMT
+from muxserve.shm_utils import create_shared_var, read_shared_var, write_shared_var
 
 from vllm.config import ModelConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -166,6 +170,9 @@ class RequestTracker:
 
         return new_requests, finished_requests
 
+    def has_new_requests(self) -> bool:
+        return self.new_requests_event.is_set()
+
     async def wait_for_new_requests(self):
         await self.new_requests_event.wait()
 
@@ -269,6 +276,19 @@ class AsyncLLMEngine:
         self.max_log_len = max_log_len
         self.engine = self._init_engine(*args, **kwargs)
 
+        self.is_muxserve = self.engine.model_config.flexstore_port is not None
+        self.model_name = self.engine.model_config.model
+        if self.is_muxserve:
+            mps_percent = os.environ.get("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", None)
+            self.sm_hold_name = SM_HOLD_NAME_FMT.format(
+                self.model_name, mps_percent,
+            )
+            self.sm_hold_var = create_shared_var(self.sm_hold_name)
+
+        # warmup engine
+        logger.info("Warmup engine...")
+        self.engine.warmup()
+
         self.background_loop = None
         # We need to keep a reference to unshielded
         # task as well to prevent it from being garbage
@@ -288,8 +308,14 @@ class AsyncLLMEngine:
             raise RuntimeError("Background loop is already running.")
         self._request_tracker.init_event()
 
+        # if self.is_muxserve:
+        #     engine_loop_fn = self.muxserve_run_engine_loop
+        # else:
+        #     engine_loop_fn = self.run_engine_loop
+        engine_loop_fn = self.run_engine_loop
+
         self._background_loop_unshielded = asyncio.get_event_loop(
-        ).create_task(self.run_engine_loop())
+        ).create_task(engine_loop_fn())
         self._background_loop_unshielded.add_done_callback(
             partial(_raise_exception_on_finish,
                     request_tracker=self._request_tracker))
@@ -342,6 +368,26 @@ class AsyncLLMEngine:
         else:
             self.engine.abort_request(request_ids)
 
+    async def muxserve_run_engine_loop(self):
+        has_requests_in_progress = False
+        while True:
+            iters = read_shared_var(self.sm_hold_var)
+            if iters <= 0:
+                await asyncio.sleep(0.002)
+                continue
+
+            while iters > 0:
+                if not has_requests_in_progress:
+                    await asyncio.sleep(0)
+                    if not self._request_tracker.has_new_requests():
+                        break
+
+                has_requests_in_progress = await self.engine_step()
+                iters -= 1
+                await asyncio.sleep(0)
+
+            write_shared_var(self.sm_hold_var, 0)
+
     async def run_engine_loop(self):
         # Initialize the RequestTracker here so it uses the right event loop.
         has_requests_in_progress = False
@@ -356,6 +402,7 @@ class AsyncLLMEngine:
         request_id: str,
         prompt: Optional[str],
         sampling_params: SamplingParams,
+        is_free_cache: Optional[bool] = None,
         prompt_token_ids: Optional[List[int]] = None,
         arrival_time: Optional[float] = None,
     ) -> AsyncStream:
@@ -370,6 +417,7 @@ class AsyncLLMEngine:
                                                               max_log_len]
             logger.info(f"Received request {request_id}: "
                         f"prompt: {shortened_prompt!r}, "
+                        f"is_free_cache: {is_free_cache},"
                         f"sampling params: {sampling_params}, "
                         f"prompt token ids: {shortened_token_ids}.")
 
@@ -387,6 +435,7 @@ class AsyncLLMEngine:
             request_id,
             prompt=prompt,
             sampling_params=sampling_params,
+            is_free_cache=is_free_cache,
             prompt_token_ids=prompt_token_ids,
             arrival_time=arrival_time)
 
@@ -397,6 +446,7 @@ class AsyncLLMEngine:
             prompt: Optional[str],
             sampling_params: SamplingParams,
             request_id: str,
+            is_free_cache: Optional[bool] = None,
             prompt_token_ids: Optional[List[int]] = None) -> RequestOutput:
         """Generate outputs for a request.
 
@@ -424,6 +474,7 @@ class AsyncLLMEngine:
             stream = await self.add_request(request_id,
                                             prompt,
                                             sampling_params,
+                                            is_free_cache=is_free_cache,
                                             prompt_token_ids=prompt_token_ids,
                                             arrival_time=arrival_time)
 
@@ -480,9 +531,10 @@ class AsyncLLMEngine:
         # Create the engine configs.
         engine_configs = engine_args.create_engine_configs()
         parallel_config = engine_configs[2]
+        ray_address = parallel_config.ray_address
         # Initialize the cluster.
         distributed_init_method, placement_group = initialize_cluster(
-            parallel_config, engine_args.engine_use_ray)
+            parallel_config, engine_args.engine_use_ray, ray_address=ray_address)
         # Create the async LLM engine.
         engine = cls(engine_args.worker_use_ray,
                      engine_args.engine_use_ray,

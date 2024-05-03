@@ -38,6 +38,8 @@ class InputMetadata:
         self.context_lens = context_lens
         self.max_context_len = max_context_len
         self.block_tables = block_tables
+        self.is_muxserve = slot_mapping.ndim >= 2
+        self.is_headwise = slot_mapping.ndim == 3
 
         self.to_cache = None
         if sliding_window is not None:
@@ -60,12 +62,20 @@ class InputMetadata:
         self.num_prompts = len(prompt_lens)
         self.num_prompt_tokens = sum(prompt_lens)
         self.num_generation_tokens = context_lens.shape[0]
-        self.num_valid_tokens = slot_mapping.shape[0]
-        if block_tables.numel() > 0:
-            self.max_num_blocks_per_seq = block_tables.shape[1]
+        if self.is_muxserve:
+            if self.is_headwise:
+                self.num_valid_tokens = slot_mapping.shape[0]
+            else:
+                self.num_valid_tokens = slot_mapping.shape[1]
+            assert self.block_tables.shape[1] == self.num_generation_tokens
+        else:
+            self.num_valid_tokens = slot_mapping.shape[0]
+            assert self.block_tables.shape[0] == self.num_generation_tokens
+
+        if self.block_tables.numel() > 0:
+            self.max_num_blocks_per_seq = self.block_tables.shape[-1]
         else:
             self.max_num_blocks_per_seq = 0
-        assert block_tables.shape[0] == self.num_generation_tokens
         assert context_lens.shape[0] == self.num_generation_tokens
 
         # Set during the execution of the first attention op.

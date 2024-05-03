@@ -8,6 +8,9 @@ from vllm.entrypoints.llm import LLM
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 
+from vllm.zmq_tool import ZMQClient, timestamp
+from vllm.config import ModelConfig
+
 __version__ = "0.2.0"
 
 __all__ = [

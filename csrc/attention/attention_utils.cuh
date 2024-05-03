@@ -22,6 +22,10 @@
 #include <float.h>
 #include <type_traits>
 
+#define WARP_SIZE 32
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
 namespace vllm {
 
 // Q*K^T operation.
@@ -52,4 +56,44 @@ struct Qk_dot {
   }
 };
 
+// Utility function for attention softmax.
+template<int NUM_WARPS>
+inline __device__ float block_sum(float* red_smem, float sum) {
+  // Decompose the thread index into warp / lane.
+  int warp = threadIdx.x / WARP_SIZE;
+  int lane = threadIdx.x % WARP_SIZE;
+
+  // Compute the sum per warp.
+#pragma unroll
+  for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+    sum += __shfl_xor_sync(uint32_t(-1), sum, mask);
+  }
+
+  // Warp leaders store the data to shared memory.
+  if (lane == 0) {
+    red_smem[warp] = sum;
+  }
+
+  // Make sure the data is in shared memory.
+  __syncthreads();
+
+  // The warps compute the final sums.
+  if (lane < NUM_WARPS) {
+    sum = red_smem[lane];
+  }
+
+  // Parallel reduction inside the warp.
+#pragma unroll
+  for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
+    sum += __shfl_xor_sync(uint32_t(-1), sum, mask);
+  }
+
+  // Broadcast to other threads.
+  return __shfl_sync(uint32_t(-1), sum, 0);
+}
+
 } // namespace vllm
+
+#undef WARP_SIZE
+#undef MAX
+#undef MIN

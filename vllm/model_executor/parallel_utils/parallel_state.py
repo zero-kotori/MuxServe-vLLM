@@ -169,6 +169,14 @@ def get_pipeline_model_parallel_prev_rank():
     return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline - 1) % world_size]
 
 
+def is_pipeline_first_stage():
+    """Return True if the caller is the first stage in the pipeline."""
+    return get_pipeline_model_parallel_rank() == 0
+
+def is_pipeline_last_stage():
+    """Return True if the caller is the last stage in the pipeline."""
+    return get_pipeline_model_parallel_rank() == (get_pipeline_model_parallel_world_size() - 1)
+
 def destroy_model_parallel():
     """Set the groups to none."""
     global _TENSOR_MODEL_PARALLEL_GROUP

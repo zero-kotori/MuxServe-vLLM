@@ -65,6 +65,7 @@ def run_vllm(
     use_beam_search: bool,
     trust_remote_code: bool,
     dtype: str,
+    gpu_memory_utilization: float,
 ) -> float:
     llm = LLM(
         model=model,
@@ -74,6 +75,7 @@ def run_vllm(
         seed=seed,
         trust_remote_code=trust_remote_code,
         dtype=dtype,
+        gpu_memory_utilization=gpu_memory_utilization,
     )
 
     # Add the requests to the engine.
@@ -173,7 +175,8 @@ def main(args: argparse.Namespace):
         elapsed_time = run_vllm(requests, args.model, args.tokenizer,
                                 args.quantization, args.tensor_parallel_size,
                                 args.seed, args.n, args.use_beam_search,
-                                args.trust_remote_code, args.dtype)
+                                args.trust_remote_code, args.dtype,
+                                args.gpu_memory_utilization)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -230,6 +233,10 @@ if __name__ == "__main__":
         'The "auto" option will use FP16 precision '
         'for FP32 and FP16 models, and BF16 precision '
         'for BF16 models.')
+    parser.add_argument("--gpu-memory-utilization",
+                        type=float,
+                        default=0.8,
+                        help="The ratio GPU memory used.")
     args = parser.parse_args()
 
     if args.backend == "vllm":

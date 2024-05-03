@@ -11,6 +11,7 @@ from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
 class EngineArgs:
     """Arguments for vLLM engine."""
     model: str
+    model_name: str = 'llm-0'
     tokenizer: Optional[str] = None
     tokenizer_mode: str = 'auto'
     trust_remote_code: bool = False
@@ -31,6 +32,12 @@ class EngineArgs:
     revision: Optional[str] = None
     tokenizer_revision: Optional[str] = None
     quantization: Optional[str] = None
+    flexstore_port: Optional[str] = None
+    ray_address: Optional[str] = None
+    mps_percentage: int = 100
+    workload_file: Optional[str] = None
+    is_prefill: bool = False
+    split_by_model: Optional[str] = None
 
     def __post_init__(self):
         if self.tokenizer is None:
@@ -46,6 +53,11 @@ class EngineArgs:
             type=str,
             default='facebook/opt-125m',
             help='name or path of the huggingface model to use')
+        parser.add_argument(
+            '--model-name',
+            type=str,
+            default=EngineArgs.model_name,
+            help='The name of served model.')
         parser.add_argument(
             '--tokenizer',
             type=str,
@@ -117,6 +129,11 @@ class EngineArgs:
                             action='store_true',
                             help='use Ray for distributed serving, will be '
                             'automatically set when using more than 1 GPU')
+        parser.add_argument('--ray-address',
+                            type=str,
+                            default=None,
+                            help='the address of the Ray cluster. If None, '
+                            'uses the default Ray cluster address.')
         parser.add_argument('--pipeline-parallel-size',
                             '-pp',
                             type=int,
@@ -166,6 +183,26 @@ class EngineArgs:
                             choices=['awq', None],
                             default=None,
                             help='Method used to quantize the weights')
+        # MuxServe multiplexing settings
+        parser.add_argument('--flexstore-port',
+                            type=str,
+                            default=EngineArgs.flexstore_port,
+                            help='The port of flexstore server')
+        parser.add_argument('--mps-percentage',
+                            type=int,
+                            default=EngineArgs.mps_percentage,
+                            help='The SM percentage of mps')
+        parser.add_argument('--workload-file',
+                            type=str,
+                            default=EngineArgs.workload_file,
+                            help='The workload file')
+        parser.add_argument('--is-prefill',
+                            action='store_true',
+                            help='Prefill mps or not')
+        parser.add_argument('--split-by-model',
+                            type=str,
+                            default=EngineArgs.split_by_model,
+                            help='split the workload by model')
         return parser
 
     @classmethod
@@ -179,18 +216,20 @@ class EngineArgs:
     def create_engine_configs(
         self,
     ) -> Tuple[ModelConfig, CacheConfig, ParallelConfig, SchedulerConfig]:
-        model_config = ModelConfig(self.model, self.tokenizer,
+        model_config = ModelConfig(self.model, self.model_name, self.tokenizer,
                                    self.tokenizer_mode, self.trust_remote_code,
                                    self.download_dir, self.load_format,
                                    self.dtype, self.seed, self.revision,
                                    self.tokenizer_revision, self.max_model_len,
-                                   self.quantization)
+                                   self.quantization, self.mps_percentage,
+                                   self.flexstore_port)
         cache_config = CacheConfig(
             self.block_size, self.gpu_memory_utilization, self.swap_space,
             getattr(model_config.hf_config, 'sliding_window', None))
         parallel_config = ParallelConfig(self.pipeline_parallel_size,
                                          self.tensor_parallel_size,
-                                         self.worker_use_ray)
+                                         self.worker_use_ray,
+                                         self.ray_address)
         scheduler_config = SchedulerConfig(self.max_num_batched_tokens,
                                            self.max_num_seqs,
                                            model_config.max_model_len)

@@ -59,13 +59,15 @@ class PagedAttention(nn.Module):
                  head_size: int,
                  scale: float,
                  num_kv_heads: Optional[int] = None,
-                 sliding_window: Optional[int] = None) -> None:
+                 sliding_window: Optional[int] = None,
+                 layer_idx: int = -1) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.sliding_window = sliding_window
+        self.layer_idx = layer_idx
 
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
@@ -149,7 +151,8 @@ class PagedAttention(nn.Module):
                 block_size]
             input_metadata: metadata for paged attention.
         """
-        block_size = value_cache.shape[3]
+        is_muxserve = input_metadata.block_tables.ndim == 3
+        block_size = value_cache.shape[2] if is_muxserve else value_cache.shape[3]
         attention_ops.single_query_cached_kv_attention(
             output,
             query,
@@ -157,7 +160,41 @@ class PagedAttention(nn.Module):
             value_cache,
             self.head_mapping,
             self.scale,
-            input_metadata.block_tables,
+            input_metadata.block_tables[self.layer_idx] if is_muxserve else input_metadata.block_tables,
+            input_metadata.context_lens,
+            block_size,
+            input_metadata.max_context_len,
+            None,  # alibi_slopes
+        )
+
+    def single_query_cached_kv_headwise_attention(
+        self,
+        output: torch.Tensor,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        input_metadata: InputMetadata,
+    ) -> None:
+        """PagedAttention for the generation tokens.
+
+        Args:
+            output: shape = [num_generation_tokens, num_heads, head_size]
+            query: shape = [num_generation_tokens, num_heads, head_size]
+            key_cache: shape = [num_blocks*num_kv_heads, head_size/x,
+                block_size, x]
+            value_cache: shape = [num_blocks*num_kv_heads, head_size,
+                block_size]
+            input_metadata: metadata for paged attention.
+        """
+        block_size = value_cache.shape[-1]
+        attention_ops.single_query_cached_kv_headwise_attention(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            self.head_mapping,
+            self.scale,
+            input_metadata.block_tables[self.layer_idx],
             input_metadata.context_lens,
             block_size,
             input_metadata.max_context_len,
@@ -229,19 +266,35 @@ class PagedAttention(nn.Module):
             # The stride is 3 because the key and value are sliced from qkv.
             key_to_cache = key[:num_valid_tokens]
             value_to_cache = value[:num_valid_tokens]
-            slot_mapping = input_metadata.slot_mapping
+            if input_metadata.slot_mapping.ndim == 2:
+                slot_mapping = input_metadata.slot_mapping[self.layer_idx]
+                assert isinstance(slot_mapping, torch.Tensor)
+            elif input_metadata.slot_mapping.ndim == 3:
+                slot_mapping = input_metadata.slot_mapping[:, self.layer_idx, :]
+                assert isinstance(slot_mapping, torch.Tensor)
+            else:
+                slot_mapping = input_metadata.slot_mapping
             if input_metadata.to_cache is not None:
                 key_to_cache = key_to_cache[input_metadata.to_cache]
                 value_to_cache = value_to_cache[input_metadata.to_cache]
                 slot_mapping = slot_mapping[input_metadata.to_cache]
 
-            cache_ops.reshape_and_cache(
-                key_to_cache,
-                value_to_cache,
-                key_cache,
-                value_cache,
-                slot_mapping,
-            )
+            if input_metadata.slot_mapping.ndim == 3:
+                cache_ops.headwise_reshape_and_cache(
+                    key_to_cache,
+                    value_to_cache,
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                )
+            else:
+                cache_ops.reshape_and_cache(
+                    key_to_cache,
+                    value_to_cache,
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                )
 
         if input_metadata.num_generation_tokens > 0:
             # Decoding run.
@@ -250,10 +303,16 @@ class PagedAttention(nn.Module):
                 "key_cache and value_cache must be provided when "
                 "generating tokens.")
             # Compute the attention op for generation tokens.
-            self.single_query_cached_kv_attention(
-                output[num_prompt_tokens:num_valid_tokens],
-                query[num_prompt_tokens:num_valid_tokens], key_cache,
-                value_cache, input_metadata)
+            if input_metadata.slot_mapping.ndim == 3:
+                self.single_query_cached_kv_headwise_attention(
+                    output[num_prompt_tokens:num_valid_tokens],
+                    query[num_prompt_tokens:num_valid_tokens], key_cache,
+                    value_cache, input_metadata)
+            else:
+                self.single_query_cached_kv_attention(
+                    output[num_prompt_tokens:num_valid_tokens],
+                    query[num_prompt_tokens:num_valid_tokens], key_cache,
+                    value_cache, input_metadata)
 
         # Reshape the output tensor.
         # NOTE(woosuk): The output tensor may include paddings.
@@ -275,12 +334,14 @@ class PagedAttentionWithRoPE(PagedAttention):
         is_neox_style: bool = True,
         rope_scaling: Optional[Dict[str, Any]] = None,
         sliding_window: Optional[int] = None,
+        layer_idx: int = -1,
     ) -> None:
         super().__init__(num_heads,
                          head_size,
                          scale,
                          num_kv_heads,
-                         sliding_window=sliding_window)
+                         sliding_window=sliding_window,
+                         layer_idx=layer_idx)
         if rope_scaling is None:
             self.rotary_emb = RotaryEmbedding(head_size, rotary_dim,
                                               max_position, base,

@@ -1,5 +1,5 @@
 """CacheEngine class for managing the KV cache."""
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import torch
 
@@ -7,6 +7,10 @@ from vllm import cache_ops
 from vllm.config import CacheConfig, ModelConfig, ParallelConfig
 from vllm.logger import init_logger
 from vllm.utils import in_wsl
+
+# for muxserve
+from torch.multiprocessing.reductions import rebuild_cuda_tensor
+from vllm.zmq_tool import ZMQClient
 
 logger = init_logger(__name__)
 
@@ -26,10 +30,12 @@ class CacheEngine:
         cache_config: CacheConfig,
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
+        tcp_client: Optional[ZMQClient] = None
     ) -> None:
         self.cache_config = cache_config
         self.model_config = model_config
         self.parallel_config = parallel_config
+        self.tcp_client = tcp_client
 
         self.head_size = model_config.get_head_size()
         self.num_layers = model_config.get_num_layers(parallel_config)
@@ -41,7 +47,10 @@ class CacheEngine:
         self.num_cpu_blocks = cache_config.num_cpu_blocks
 
         # Initialize the cache.
-        self.gpu_cache = self.allocate_gpu_cache()
+        if self.tcp_client is not None:
+            self.gpu_cache = self.get_gpu_cache_from_flexstore()
+        else:
+            self.gpu_cache = self.allocate_gpu_cache()
         self.cpu_cache = self.allocate_cpu_cache()
 
         # Initialize the stream for caching operations.
@@ -66,6 +75,33 @@ class CacheEngine:
             self.head_size,
             self.block_size,
         )
+
+    '''
+    suppose the data from muxserve memory manager server like:
+
+    # data: [torch.Tensor(handler_k), torch.Tensor(handler_v)]
+    '''
+    def get_gpu_cache_from_flexstore(self) -> KVCache:
+        # suppose our model was deployed on single card now
+        logger.info(f'connecting server from client cuda{str(torch.cuda.current_device())}')
+
+        # ask the server for the kv-cache
+        rank = torch.distributed.get_rank()
+        self.tcp_client.send_pyobj(
+            ["cache_init", [rank, self.model_config.model_name]]
+        )
+        kv_blocks = self.tcp_client.recv_pyobj()
+        logger.info(f'data received, rebuilding from client cuda{str(torch.cuda.current_device())}')
+
+        key_blocks = rebuild_cuda_tensor(torch.Tensor, **(kv_blocks[0]))
+        value_blocks = rebuild_cuda_tensor(torch.Tensor, **(kv_blocks[1]))
+        assert key_blocks.is_cuda
+        assert value_blocks.is_cuda
+        gpu_cache = (key_blocks, value_blocks)
+
+        self.num_gpu_blocks = key_blocks.shape[0]
+        self.cache_config.num_gpu_blocks = self.num_gpu_blocks
+        return gpu_cache
 
     def allocate_gpu_cache(self) -> List[KVCache]:
         gpu_cache: List[KVCache] = []

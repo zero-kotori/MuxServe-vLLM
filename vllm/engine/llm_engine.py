@@ -16,7 +16,7 @@ from vllm.sequence import (SamplerOutput, Sequence, SequenceGroup,
                            SequenceStatus)
 from vllm.transformers_utils.tokenizer import (detokenize_incrementally,
                                                get_tokenizer)
-from vllm.utils import Counter
+from vllm.utils import Counter, random_uuid
 
 if ray:
     from ray.air.util.torch_dist import init_torch_dist_process_group
@@ -112,8 +112,15 @@ class LLMEngine:
         # Profile the memory usage and initialize the cache.
         self._init_cache()
 
+        # tcp client for muxserve
+        self.tcp_client = None
+        if self.model_config.flexstore_port is not None:
+            from vllm.zmq_tool import ZMQClient
+            self.tcp_client = ZMQClient('localhost', self.model_config.flexstore_port)
         # Create the scheduler.
-        self.scheduler = Scheduler(scheduler_config, cache_config)
+        self.scheduler = Scheduler(
+            scheduler_config, cache_config, self.model_config, self.parallel_config, self.tcp_client
+        )
 
         # Logging.
         self.last_logging_time = 0.0
@@ -121,6 +128,11 @@ class LLMEngine:
         self.num_prompt_tokens: List[Tuple[float, int]] = []
         # List of (timestamp, num_tokens)
         self.num_generation_tokens: List[Tuple[float, int]] = []
+
+        # warmup engine
+        logger.info("Warmup engine...")
+        self.warmup()
+        logger.info("LLM Engine begins serving...")
 
     def _init_workers(self, distributed_init_method: str):
         # Lazy import the Worker to avoid importing torch.cuda/xformers
@@ -137,6 +149,7 @@ class LLMEngine:
             self.scheduler_config,
             0,
             distributed_init_method,
+            self.model_config.flexstore_port
         )
         self.workers.append(worker)
         self._run_workers(
@@ -177,6 +190,7 @@ class LLMEngine:
                               scheduler_config,
                               None,
                               None,
+                              self.model_config.flexstore_port
                           ))
         self._run_workers(
             "init_model",
@@ -189,6 +203,32 @@ class LLMEngine:
 
     def _init_cache(self) -> None:
         """Profiles the memory usage and initializes the KV cache."""
+        if self.model_config.flexstore_port is not None:
+            num_cpu_blocks = self._run_workers(
+                "get_num_available_cpu_blocks",
+                get_all_outputs=True,
+                block_size=self.cache_config.block_size,
+                cpu_swap_space=self.cache_config.swap_space_bytes,
+            )
+            num_cpu_blocks = min(num_cpu_blocks)
+            # for muxserve, we need to get the num_cpu_blocks and num_gpu_blocks from the server,
+            # the vllm process is not responsible for profile num available blocks
+            # FIXME: currently we set cpu_blocks locally
+            self.cache_config.num_cpu_blocks = num_cpu_blocks
+            self._run_workers("init_cache_engine", cache_config=self.cache_config)
+
+            # set gpu_blocks
+            num_gpu_blocks_outputs = self._run_workers(
+                "get_num_available_gpu_blocks",
+                get_all_outputs=True
+            )
+            for num_gpu_blocks in num_gpu_blocks_outputs:
+                assert num_gpu_blocks == num_gpu_blocks_outputs[0]
+            self.cache_config.num_gpu_blocks = num_gpu_blocks_outputs[0]
+            logger.info(f"# GPU blocks: {num_gpu_blocks}, "
+                        f"# CPU blocks: {num_cpu_blocks}")
+            return
+
         # Get the maximum number of blocks that can be allocated on GPU and CPU.
         num_blocks = self._run_workers(
             "profile_num_available_blocks",
@@ -224,9 +264,10 @@ class LLMEngine:
         # Create the engine configs.
         engine_configs = engine_args.create_engine_configs()
         parallel_config = engine_configs[2]
+        ray_address = parallel_config.ray_address
         # Initialize the cluster.
         distributed_init_method, placement_group = initialize_cluster(
-            parallel_config)
+            parallel_config, ray_address=ray_address)
         # Create the LLM engine.
         engine = cls(*engine_configs,
                      distributed_init_method,
@@ -240,6 +281,7 @@ class LLMEngine:
         prompt: Optional[str],
         sampling_params: SamplingParams,
         prompt_token_ids: Optional[List[int]] = None,
+        is_free_cache: Optional[bool] = None,
         arrival_time: Optional[float] = None,
     ) -> None:
         """Add a request to the engine's request pool.
@@ -266,8 +308,8 @@ class LLMEngine:
 
         # Create the sequences.
         block_size = self.cache_config.block_size
-        seq_id = next(self.seq_counter)
-        seq = Sequence(seq_id, prompt, prompt_token_ids, block_size)
+        # seq_id = next(self.seq_counter)
+        seq = Sequence(request_id, prompt, prompt_token_ids, block_size, is_free_cache)
 
         # Create the sequence group.
         seq_group = SequenceGroup(request_id, [seq], sampling_params,
@@ -283,6 +325,14 @@ class LLMEngine:
             request_id: The ID(s) of the request to abort.
         """
         self.scheduler.abort_seq_group(request_id)
+
+    def release_request(self, request_id: Union[str, Iterable[str]]) -> None:
+        """Releases a request(s) with the given ID.
+
+        Args:
+            request_id: The ID(s) of the request to release.
+        """
+        self.scheduler.release_seq_group(request_id)
 
     def get_model_config(self) -> ModelConfig:
         """Gets the model configuration."""
@@ -563,6 +613,25 @@ class LLMEngine:
 
         return self._process_model_outputs(output, scheduler_outputs) + ignored
 
+    def warmup(self) -> None:
+        """Warms up the engine and cuda context."""
+        prompt = "Hello world! Let's Warmup" * 5
+        sampling_params = SamplingParams(
+            n=1, use_beam_search=False, temperature=0.0, max_tokens=5
+        )
+        for _ in range(16):
+            self.add_request(random_uuid(), prompt, sampling_params)
+        while self.has_unfinished_requests():
+            request_outputs = self.step()
+
+            finished_req_ids = []
+            for request_output in request_outputs:
+                if request_output.finished:
+                    finished_req_ids.append(request_output.request_id)
+
+            if finished_req_ids:
+                self.abort_request(finished_req_ids)
+
     def _log_system_stats(
         self,
         prompt_run: bool,
@@ -600,7 +669,7 @@ class LLMEngine:
         else:
             avg_generation_throughput = 0.0
 
-        total_num_gpu_blocks = self.cache_config.num_gpu_blocks
+        total_num_gpu_blocks = self.scheduler.block_manager.get_num_gpu_blocks()
         num_free_gpu_blocks = (
             self.scheduler.block_manager.get_num_free_gpu_blocks())
         num_used_gpu_blocks = total_num_gpu_blocks - num_free_gpu_blocks
@@ -615,7 +684,8 @@ class LLMEngine:
         else:
             cpu_cache_usage = 0.0
 
-        logger.info("Avg prompt throughput: "
+        model = self.model_config.model.split("/")[-1]
+        logger.info(f"[{model}] Avg prompt throughput: "
                     f"{avg_prompt_throughput:.1f} tokens/s, "
                     "Avg generation throughput: "
                     f"{avg_generation_throughput:.1f} tokens/s, "

@@ -43,9 +43,33 @@ def main(args: argparse.Namespace):
             break
 
 
+def main_profile(args: argparse.Namespace):
+    # Parse the CLI argument and initialize the engine.
+    engine_args = EngineArgs.from_cli_args(args)
+    engine = LLMEngine.from_engine_args(engine_args)
+
+    prompt_token_ids = [128] * 512
+    sample_param = SamplingParams(n=1, best_of=1, use_beam_search=False,
+                                  temperature=0.0, max_tokens=16)
+    for i in range(128):
+        engine.add_request(str(i), None, sample_param, prompt_token_ids)
+
+    # Run the engine by calling `engine.step()` manually.
+    while True:
+        request_outputs = engine.step()
+
+        if not engine.has_unfinished_requests():
+            break
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Demo on using the LLMEngine class directly')
+    parser.add_argument('--profile', action="store_true")
     parser = EngineArgs.add_cli_args(parser)
     args = parser.parse_args()
-    main(args)
+
+    if args.profile:
+        main_profile(args)
+    else:
+        main(args)

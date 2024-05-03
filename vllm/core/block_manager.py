@@ -1,9 +1,13 @@
 """A block manager that manages token blocks."""
 from typing import Dict, List, Optional, Set, Tuple
 
+import numpy as np
+import torch
+
 from vllm.block import PhysicalTokenBlock
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 from vllm.utils import Device
+from vllm.zmq_tool import ZMQClient
 
 
 class BlockAllocator:
@@ -19,23 +23,30 @@ class BlockAllocator:
         device: Device,
         block_size: int,
         num_blocks: int,
+        group_size: int,
     ) -> None:
         self.device = device
         self.block_size = block_size
-        self.num_blocks = num_blocks
 
         # Initialize the free blocks.
-        self.free_blocks: List[PhysicalTokenBlock] = []
-        for i in range(num_blocks):
+        self.free_blocks: Dict[int, PhysicalTokenBlock] = {}
+        for i in range(0, num_blocks, group_size):
             block = PhysicalTokenBlock(device=device,
                                        block_number=i,
                                        block_size=block_size)
-            self.free_blocks.append(block)
+            self.free_blocks[i] = block
+
+        self.num_blocks = len(self.free_blocks)
+
+    def get_token_block(self, block_number: int):
+        block = self.free_blocks.pop(block_number)
+        block.ref_count += 1
+        return block
 
     def allocate(self) -> PhysicalTokenBlock:
         if not self.free_blocks:
             raise ValueError("Out of memory! No free blocks are available.")
-        block = self.free_blocks.pop()
+        _, block = self.free_blocks.popitem()
         block.ref_count = 1
         return block
 
@@ -44,7 +55,7 @@ class BlockAllocator:
             raise ValueError(f"Double free! {block} is already freed.")
         block.ref_count -= 1
         if block.ref_count == 0:
-            self.free_blocks.append(block)
+            self.free_blocks[block.block_number] = block
 
     def get_num_free_blocks(self) -> int:
         return len(self.free_blocks)
@@ -59,15 +70,23 @@ class BlockSpaceManager:
 
     def __init__(
         self,
+        model_name: str,
+        num_layers: int,
+        num_heads: int,
         block_size: int,
         num_gpu_blocks: int,
         num_cpu_blocks: int,
         watermark: float = 0.01,
         sliding_window: Optional[int] = None,
+        tcp_client: Optional[ZMQClient] = None,
     ) -> None:
+        self.model_name = model_name
+        self.num_layers = num_layers
+        self.num_heads = num_heads
         self.block_size = block_size
         self.num_total_gpu_blocks = num_gpu_blocks
         self.num_total_cpu_blocks = num_cpu_blocks
+        self.tcp_client = tcp_client
 
         self.block_sliding_window = None
         if sliding_window is not None:
@@ -78,13 +97,22 @@ class BlockSpaceManager:
         self.watermark = watermark
         assert watermark >= 0.0
 
+        if tcp_client is not None:
+            group_size = self.num_heads * self.num_layers
+        else:
+            group_size = 1
         self.watermark_blocks = int(watermark * num_gpu_blocks)
         self.gpu_allocator = BlockAllocator(Device.GPU, block_size,
-                                            num_gpu_blocks)
+                                            num_gpu_blocks, group_size)
         self.cpu_allocator = BlockAllocator(Device.CPU, block_size,
-                                            num_cpu_blocks)
+                                            num_cpu_blocks, group_size)
         # Mapping: seq_id -> BlockTable.
         self.block_tables: Dict[int, BlockTable] = {}
+        self.layer_block_tables: Dict[int, List[BlockTable]] = {}
+
+        # construct layerwise block table
+        self.layerwise_table_np_cache: Dict[int, Tuple(int, np.array)] = {}
+        self.layer_offsets = np.arange(self.num_layers, dtype=np.int32).reshape(-1, 1)
 
     def can_allocate(self, seq_group: SequenceGroup) -> bool:
         # FIXME(woosuk): Here we assume that all sequences in the group share
@@ -119,6 +147,56 @@ class BlockSpaceManager:
         # Assign the block table for each sequence.
         for seq in seq_group.get_seqs():
             self.block_tables[seq.seq_id] = block_table.copy()
+
+    def layerwise_allocate(self, seq_group: SequenceGroup) -> int:
+        """
+        Return:
+            -1: fail
+            0: success
+            1: find block table
+        """
+        seq = seq_group.get_seqs()[0]
+
+        # first, check if the prompt is already cached
+        request_id = seq_group.request_id
+        rank = 0 # assume tensor-model parallelism only
+        num_gpu_blocks = len(seq.logical_token_blocks)
+        # try to load blocktable
+        self.tcp_client.send_pyobj(("blocktable_load", [request_id]))
+        self.layerwise_table_np_cache[seq.seq_id] = (-1, None)
+        data = self.tcp_client.recv_pyobj()
+        if data is not None:
+            # set the block table for sequence
+            layerwise_block_tables: List[BlockTable] = []
+            for token_block_number in data:
+                block = self.gpu_allocator.get_token_block(token_block_number)
+                layerwise_block_tables.append(block)
+            self.layer_block_tables[seq.seq_id] = layerwise_block_tables
+            for seq in seq_group.get_seqs():
+                seq.in_prefill = False
+            return 1
+
+        # try to alloc block table
+        self.tcp_client.send_pyobj(
+            ("cache_alloc", [request_id, rank, self.model_name, num_gpu_blocks])
+        )
+        free_block_ids = self.tcp_client.recv_pyobj()
+
+        if free_block_ids is None:
+            return -1
+
+        # Allocate new physical token blocks that will store the prompt tokens.
+        layerwise_block_tables: List[BlockTable] = []
+        for i, block_idx in enumerate(free_block_ids):
+            block = self.gpu_allocator.get_token_block(block_idx)
+            # Set the reference counts of the token blocks.
+            block.ref_count = seq_group.num_seqs()
+            layerwise_block_tables.append(block)
+
+        # Assign the block table for each sequence.
+        for seq in seq_group.get_seqs():
+            self.layer_block_tables[seq.seq_id] = layerwise_block_tables.copy()
+        return 0
 
     def can_append_slot(self, seq_group: SequenceGroup) -> bool:
         # Simple heuristic: If there is at least one free block
@@ -158,6 +236,39 @@ class BlockSpaceManager:
             block_table[-1] = new_block
             self.gpu_allocator.free(last_block)
             return last_block.block_number, new_block.block_number
+
+    def layerwise_append_slot(self, seq: Sequence) -> int:
+        logical_blocks = seq.logical_token_blocks
+        layerwise_block_tables = self.layer_block_tables[seq.seq_id]
+
+        # set to not in_prefill
+        seq.in_prefill = False
+
+        if len(layerwise_block_tables) < len(logical_blocks):
+            # FIXME: disable sliding window now
+            # allocate a new block table for each layer
+            request_id = seq.seq_id
+            rank = 0 # assume tensor-model parallelism only
+            num_gpu_blocks = 1
+            self.tcp_client.send_pyobj(
+                ("cache_alloc", [request_id, rank, self.model_name, num_gpu_blocks])
+            )
+            free_block_ids = self.tcp_client.recv_pyobj()
+            if free_block_ids is None:
+                return -1
+
+            block = self.gpu_allocator.get_token_block(free_block_ids[0])
+            layerwise_block_tables.append(block)
+
+        # We want to append the token to the last physical block.
+        last_block = layerwise_block_tables[-1]
+        assert last_block.device == Device.GPU
+        if last_block.ref_count == 1:
+            # Not shared with other sequences. Appendable.
+            return 1
+        else:
+            # FIXME: we disable beam_seam now
+            raise ValueError("beam search is not supported now")
 
     def fork(self, parent_seq: Sequence, child_seq: Sequence) -> None:
         # NOTE: fork does not allocate a new physical block.
@@ -250,12 +361,28 @@ class BlockSpaceManager:
                 self.cpu_allocator.free(block)
 
     def free(self, seq: Sequence) -> None:
-        if seq.seq_id not in self.block_tables:
+        if seq.seq_id not in self.block_tables and seq.seq_id not in self.layer_block_tables:
             # Already freed or haven't been scheduled yet.
             return
-        block_table = self.block_tables[seq.seq_id]
-        self._free_block_table(block_table)
-        del self.block_tables[seq.seq_id]
+        if self.tcp_client is not None:
+            block_tables = self.layer_block_tables.pop(seq.seq_id)
+            block_ids = [block.block_number for block in block_tables]
+            if seq.is_free_cache or not seq.in_prefill:
+                rank = 0 # assume tensor-model parallelism only
+                self.tcp_client.send_pyobj(
+                    ("free_cache", [seq.seq_id, rank, self.model_name, block_ids])
+                )
+            else:
+                self.tcp_client.send_pyobj(
+                    ("blocktable_store", [seq.seq_id, block_ids])
+                )
+            _ = self.tcp_client.recv_pyobj()
+
+            self._free_block_table(block_tables)
+        else:
+            block_table = self.block_tables[seq.seq_id]
+            self._free_block_table(block_table)
+            del self.block_tables[seq.seq_id]
 
     def reset(self) -> None:
         for block_table in self.block_tables.values():
@@ -265,6 +392,24 @@ class BlockSpaceManager:
     def get_block_table(self, seq: Sequence) -> List[int]:
         block_table = self.block_tables[seq.seq_id]
         return [block.block_number for block in block_table]
+
+    def get_layer_block_table(self, seq: Sequence) -> List[List[int]]:
+        layerwise_blks = self.layer_block_tables[seq.seq_id]
+        # use numpy array and cache to walk around the python list overhead
+        if self.layerwise_table_np_cache[seq.seq_id][0] == len(layerwise_blks):
+            return self.layerwise_table_np_cache[seq.seq_id][1]
+
+        block_table = np.array(
+            [block.block_number for block in layerwise_blks], dtype=np.int32
+        )
+        block_table = block_table.reshape(1, -1) // self.num_heads
+        block_table = block_table + self.layer_offsets
+        # cache the numpy array
+        self.layerwise_table_np_cache[seq.seq_id] = (len(layerwise_blks), block_table)
+        return block_table
+
+    def get_num_gpu_blocks(self) -> int:
+        return self.gpu_allocator.num_blocks
 
     def get_num_free_gpu_blocks(self) -> int:
         return self.gpu_allocator.get_num_free_blocks()

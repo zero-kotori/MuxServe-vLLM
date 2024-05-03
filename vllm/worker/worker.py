@@ -2,6 +2,7 @@
 import os
 from typing import Dict, List, Tuple, Optional
 
+import numpy as np
 import torch
 import torch.distributed
 
@@ -31,6 +32,7 @@ class Worker:
         scheduler_config: SchedulerConfig,
         rank: Optional[int] = None,
         distributed_init_method: Optional[str] = None,
+        flexstore_port: str = None
     ) -> None:
         self.model_config = model_config
         self.parallel_config = parallel_config
@@ -46,6 +48,12 @@ class Worker:
         self.cache_engine = None
         self.cache_events = None
         self.gpu_cache = None
+
+        # tcp client for muxserve
+        self.tcp_client = None
+        if flexstore_port is not None:
+            from vllm.zmq_tool import ZMQClient
+            self.tcp_client = ZMQClient('localhost', flexstore_port)
 
     def init_model(self):
         # This env var set by Ray causes exceptions with graph building.
@@ -67,7 +75,26 @@ class Worker:
 
         # Initialize the model.
         set_random_seed(self.model_config.seed)
-        self.model = get_model(self.model_config)
+        self.model = get_model(self.model_config, self.tcp_client)
+
+    def get_num_available_cpu_blocks(self,
+        block_size: int,
+        cpu_swap_space: int,
+    ) -> int:
+        cache_block_size = CacheEngine.get_cache_block_size(
+            block_size, self.model_config, self.parallel_config)
+        num_cpu_blocks = int(cpu_swap_space // cache_block_size)
+        num_cpu_blocks = max(num_cpu_blocks, 0)
+
+        # Reset the seed to ensure that the random state is not affected by
+        # the model initialization and profiling.
+        set_random_seed(self.model_config.seed)
+        return num_cpu_blocks
+
+    def get_num_available_gpu_blocks(self) -> int:
+        # Reset the seed to ensure that the random state is not affected
+        set_random_seed(self.model_config.seed)
+        return self.cache_config.num_gpu_blocks
 
     @torch.inference_mode()
     def profile_num_available_blocks(
@@ -99,6 +126,7 @@ class Worker:
                 is_prompt=True,
                 seq_data={group_id: seq_data},
                 sampling_params=sampling_params,
+                layer_block_tables=None,
                 block_tables=None,
             )
             seqs.append(seq)
@@ -149,7 +177,7 @@ class Worker:
         _check_if_can_support_max_seq_len(max_seq_len, self.block_size)
 
         self.cache_engine = CacheEngine(self.cache_config, self.model_config,
-                                        self.parallel_config)
+                                        self.parallel_config, self.tcp_client)
         self.cache_events = self.cache_engine.events
         self.gpu_cache = self.cache_engine.gpu_cache
 
@@ -161,6 +189,12 @@ class Worker:
         input_tokens: List[int] = []
         input_positions: List[int] = []
         slot_mapping: List[int] = []
+
+        # For muxserve
+        if seq_group_metadata_list[0].is_muxserve:
+            num_layers = len(next(iter(seq_group_metadata_list[0].layer_block_tables.values())))
+            layer_slot_mapping: List[List[int]] = [[] for _ in range(num_layers)]
+            layer_slot_mapping_np = None
 
         # Add prompt tokens.
         prompt_lens: List[int] = []
@@ -185,19 +219,33 @@ class Worker:
             # is always the first token in the sequence.
             input_positions.extend(range(len(prompt_tokens)))
 
-            if seq_group_metadata.block_tables is None:
+            if not seq_group_metadata.is_muxserve and seq_group_metadata.block_tables is None:
                 # During memory profiling, the block tables are not initialized
                 # yet. In this case, we just use a dummy slot mapping.
                 slot_mapping.extend([0] * prompt_len)
                 continue
 
             # Compute the slot mapping.
-            block_table = seq_group_metadata.block_tables[seq_id]
-            for i in range(prompt_len):
-                block_number = block_table[i // self.block_size]
-                block_offset = i % self.block_size
-                slot = block_number * self.block_size + block_offset
-                slot_mapping.append(slot)
+            if seq_group_metadata.is_muxserve:
+                layer_block_tab = seq_group_metadata.layer_block_tables[seq_id]
+                (num_layers, num_blocks) = layer_block_tab.shape
+                layer_block_tab = layer_block_tab.reshape(num_layers, num_blocks, 1)
+                block_offs = np.arange(self.block_size).reshape(1, 1, self.block_size)
+                slot_mappings = layer_block_tab * self.block_size + block_offs
+                slot_mappings = slot_mappings.reshape(num_layers, num_blocks * self.block_size)
+                slot_mappings = slot_mappings[:, :prompt_len]
+
+                if layer_slot_mapping_np is None:
+                    layer_slot_mapping_np = slot_mappings
+                else:
+                    layer_slot_mapping_np = np.concatenate((layer_slot_mapping_np, slot_mappings), axis=1)
+            else:
+                block_table = seq_group_metadata.block_tables[seq_id]
+                for i in range(prompt_len):
+                    block_number = block_table[i // self.block_size]
+                    block_offset = i % self.block_size
+                    slot = block_number * self.block_size + block_offset
+                    slot_mapping.append(slot)
 
         # Add generation tokens.
         max_context_len = 0
@@ -223,23 +271,60 @@ class Worker:
                     context_len = min(context_len, self.sliding_window)
                 input_positions.append(position)
 
-                block_table = seq_group_metadata.block_tables[seq_id]
+                if seq_group_metadata.is_muxserve:
+                    layer_block_table = seq_group_metadata.layer_block_tables[seq_id]
+                    block_table = layer_block_table[0]
 
-                max_context_len = max(max_context_len, context_len)
-                max_num_blocks_per_seq = max(max_num_blocks_per_seq,
-                                             len(block_table))
-                context_lens.append(context_len)
+                    max_context_len = max(max_context_len, context_len)
+                    max_num_blocks_per_seq = max(max_num_blocks_per_seq,
+                                                 len(block_table))
+                    context_lens.append(context_len)
 
-                block_number = block_table[position // self.block_size]
-                block_offset = position % self.block_size
-                slot = block_number * self.block_size + block_offset
-                slot_mapping.append(slot)
+                    layer_block_tab = seq_group_metadata.layer_block_tables[seq_id]
+                    layer_block_tab = layer_block_tab[:, -1].reshape(-1, 1)
+                    block_offset = position % self.block_size
+                    block_offs = np.array(block_offset).reshape(1, 1)
+                    slot_mappings = layer_block_tab * self.block_size + block_offs
 
-                if self.sliding_window is not None:
-                    sliding_window_blocks = (self.sliding_window //
-                                             self.block_size)
-                    block_table = block_table[-sliding_window_blocks:]
-                generation_block_tables.append(block_table)
+                    if layer_slot_mapping_np is None:
+                        layer_slot_mapping_np = slot_mappings
+                    else:
+                        layer_slot_mapping_np = np.concatenate((layer_slot_mapping_np, slot_mappings), axis=1)
+                else:
+                    block_table = seq_group_metadata.block_tables[seq_id]
+
+                    max_context_len = max(max_context_len, context_len)
+                    max_num_blocks_per_seq = max(max_num_blocks_per_seq,
+                                                 len(block_table))
+                    context_lens.append(context_len)
+
+                    block_number = block_table[position // self.block_size]
+                    block_offset = position % self.block_size
+                    slot = block_number * self.block_size + block_offset
+                    slot_mapping.append(slot)
+
+                    if self.sliding_window is not None:
+                        sliding_window_blocks = (self.sliding_window //
+                                                 self.block_size)
+                        block_table = block_table[-sliding_window_blocks:]
+                    generation_block_tables.append(block_table)
+
+        if seq_group_metadata.is_muxserve:
+            # use numpy array to workaround the slow access of python list
+            generation_layer_block_tables = np.zeros(
+                (num_layers, len(context_lens), max_num_blocks_per_seq),
+                dtype=np.int32)
+
+            idx = 0
+            for seq_group_metadata in seq_group_metadata_list:
+                if seq_group_metadata.is_prompt:
+                    continue
+
+                for seq_id in list(seq_group_metadata.seq_data.keys()):
+                    layer_block_table = seq_group_metadata.layer_block_tables[seq_id]
+                    num_blocks = layer_block_table.shape[1]
+
+                    generation_layer_block_tables[:, idx, :num_blocks] = layer_block_table
 
         # Optimization: Pad the input length to be a multiple of 8.
         # This is required for utilizing the Tensor Cores in NVIDIA GPUs.
@@ -248,24 +333,37 @@ class Worker:
 
         # Convert to tensors.
         tokens_tensor = torch.tensor(input_tokens,
-                                     dtype=torch.long,
-                                     device="cuda")
+                                     dtype=torch.long)
         positions_tensor = torch.tensor(input_positions,
-                                        dtype=torch.long,
-                                        device="cuda")
-        slot_mapping_tensor = torch.tensor(slot_mapping,
-                                           dtype=torch.int,
-                                           device="cuda")
+                                        dtype=torch.long)
         context_lens_tensor = torch.tensor(context_lens,
-                                           dtype=torch.int,
-                                           device="cuda")
-        padded_block_tables = [
-            _pad_to_max(block_table, max_num_blocks_per_seq)
-            for block_table in generation_block_tables
-        ]
-        block_tables_tensor = torch.tensor(padded_block_tables,
-                                           dtype=torch.int,
-                                           device="cuda")
+                                           dtype=torch.int)
+        if seq_group_metadata.is_muxserve:
+            if layer_slot_mapping_np is None:
+                slot_mappings = layer_slot_mapping
+            else:
+                slot_mappings = layer_slot_mapping_np
+            slot_mapping_tensor = torch.tensor(slot_mappings,
+                                               dtype=torch.int64)
+            block_tables_tensor = torch.tensor(generation_layer_block_tables,
+                                               dtype=torch.int)
+        else:
+            slot_mapping_tensor = torch.tensor(slot_mapping,
+                                               dtype=torch.int64)
+
+            padded_block_tables = [
+                _pad_to_max(block_table, max_num_blocks_per_seq)
+                for block_table in generation_block_tables
+            ]
+            block_tables_tensor = torch.tensor(padded_block_tables,
+                                               dtype=torch.int)
+
+        # async copy to gpu
+        tokens_tensor = tokens_tensor.cuda(non_blocking=True)
+        positions_tensor = positions_tensor.cuda(non_blocking=True)
+        context_lens_tensor = context_lens_tensor.cuda(non_blocking=True)
+        slot_mapping_tensor = slot_mapping_tensor.cuda(non_blocking=True)
+        block_tables_tensor = block_tables_tensor.cuda(non_blocking=True)
 
         seq_data: Dict[int, SequenceData] = {}
         for seq_group_metadata in seq_group_metadata_list:

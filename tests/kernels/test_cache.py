@@ -106,7 +106,7 @@ def test_reshape_and_cache(
     # Create a random slot mapping.
     num_slots = block_size * num_blocks
     slot_mapping = random.sample(range(num_slots), num_tokens)
-    slot_mapping = torch.tensor(slot_mapping, dtype=torch.int, device="cuda")
+    slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64, device="cuda")
 
     qkv = torch.randn(num_tokens,
                       3,

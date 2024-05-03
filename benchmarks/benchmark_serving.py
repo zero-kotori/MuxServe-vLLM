@@ -82,8 +82,12 @@ def sample_requests(
 async def get_request(
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
+    seed: int = 0,
 ) -> AsyncGenerator[Tuple[str, int, int], None]:
     input_requests = iter(input_requests)
+
+    np.random.seed(seed)
+
     for request in input_requests:
         yield request
 
@@ -91,7 +95,9 @@ async def get_request(
             # If the request rate is infinity, then we don't need to wait.
             continue
         # Sample the request interval from the exponential distribution.
-        interval = np.random.exponential(1.0 / request_rate)
+        # interval = np.random.exponential(1.0 / request_rate)
+        # Sample the request interval from the poisson distribution.
+        interval = np.random.gamma(1.0, 1.0 / request_rate)
         # The next request will be sent after the interval.
         await asyncio.sleep(interval)
 
@@ -195,13 +201,13 @@ def main(args: argparse.Namespace):
         latency / (prompt_len + output_len)
         for prompt_len, output_len, latency in REQUEST_LATENCY
     ])
-    print(f"Average latency per token: {avg_per_token_latency:.2f} s")
+    print(f"Average latency per token: {avg_per_token_latency:.3f} s")
     avg_per_output_token_latency = np.mean([
         latency / output_len
         for _, output_len, latency in REQUEST_LATENCY
     ])
     print("Average latency per output token: "
-          f"{avg_per_output_token_latency:.2f} s")
+          f"{avg_per_output_token_latency:.3f} s")
 
 
 if __name__ == "__main__":

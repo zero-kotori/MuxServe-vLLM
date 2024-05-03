@@ -92,6 +92,7 @@ class LlamaAttention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
+        layer_idx: int = -1,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -141,7 +142,8 @@ class LlamaAttention(nn.Module):
             max_position=self.max_position_embeddings,
             rotary_dim=self.head_dim,
             num_kv_heads=self.num_kv_heads,
-            rope_scaling=rope_scaling)
+            rope_scaling=rope_scaling,
+            layer_idx=layer_idx)
 
     def forward(
         self,
@@ -166,6 +168,7 @@ class LlamaDecoderLayer(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        layer_idx: int = -1,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -182,6 +185,7 @@ class LlamaDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
+            layer_idx=layer_idx,
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
@@ -240,8 +244,8 @@ class LlamaModel(nn.Module):
             config.hidden_size,
         )
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, quant_config)
-            for _ in range(config.num_hidden_layers)
+            LlamaDecoderLayer(config, quant_config, lid)
+            for lid in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -263,7 +267,7 @@ class LlamaModel(nn.Module):
             hidden_states = layer(
                 positions,
                 hidden_states,
-                kv_caches[i],
+                kv_caches if input_metadata.is_muxserve else kv_caches[i],
                 input_metadata,
                 cache_event,
             )
