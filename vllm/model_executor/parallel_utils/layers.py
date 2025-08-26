@@ -277,15 +277,36 @@ class RowParallelLinear(torch.nn.Module):
             - output
             - bias
         """
+        # torch.cuda.synchronize()
+        # print(f"memory status = {torch.cuda.mem_get_info()[0] / (2**30)}, {torch.cuda.mem_get_info()[1] / (2**30)}")
+        # print(f"allocated = {torch.cuda.memory_allocated() / (2**30)}")
+        # print(f"reserved = {torch.cuda.memory_reserved() / (2**30)}")
         # Set up backprop all-reduce.
-        if self.input_is_parallel:
-            input_parallel = input_
-        else:
-            # TODO: simplify code below
-            tp_rank = get_tensor_model_parallel_rank()
-            splitted_input = split_tensor_along_last_dim(
-                input_, num_partitions=self.tp_size)
-            input_parallel = splitted_input[tp_rank].contiguous()
+        try:
+            if self.input_is_parallel:
+                input_parallel = input_
+                # print(f"directly get input_parallel!")
+                # input_parallel_ = input_parallel.cpu()
+                # print(f"get input_parallel_!")
+            else:
+                # TODO: simplify code below
+                tp_rank = get_tensor_model_parallel_rank()
+                # print(f"rank = {tp_rank}, input_ shape = {input_.shape}")
+                # input__ = input_.cpu()
+                # print(f"get input__!")
+                splitted_input = split_tensor_along_last_dim(
+                    input_, num_partitions=self.tp_size)
+                # splitted_input_ = splitted_input.cpu()
+                # print(f"get splitted_input_!")
+                input_parallel = splitted_input[tp_rank].contiguous()
+                # input_parallel_ = input_parallel.cpu()
+                # print(f"get input_parallel_!")
+        except Exception as e:
+            print(f"LCH: LAYERS Meet exception: {e}")
+            import sys
+            import traceback
+            exc_info = sys.exc_info()
+            print("".join(traceback.format_exception(*exc_info)))
 
         # Matrix multiply.
         output_parallel = self.apply_weights(input_parallel)

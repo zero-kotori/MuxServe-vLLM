@@ -187,6 +187,10 @@ class PagedAttention(nn.Module):
             input_metadata: metadata for paged attention.
         """
         block_size = value_cache.shape[-1]
+        # print(f"In single_query_cached_kv_headwise_attention!")
+        # print(f"shape = {output.shape}, {query.shape}, {key_cache.shape}, {value_cache.shape}")
+        # print(f"head_mapping = {self.head_mapping}")
+        # print(f"block_tables = {input_metadata.block_tables[self.layer_idx]}")
         attention_ops.single_query_cached_kv_headwise_attention(
             output,
             query,
@@ -200,6 +204,12 @@ class PagedAttention(nn.Module):
             input_metadata.max_context_len,
             None,  # alibi_slopes
         )
+        # print(f"End single_query_cached_kv_headwise_attention!")
+        # try:
+        #     torch.cuda.synchronize()
+        # except Exception as e:
+        #     print(f"Error in single_query_cached_kv_headwise_attention!")
+        #     print(f"rank = {torch.distributed.get_rank()}")
 
     def forward(
         self,
@@ -252,6 +262,9 @@ class PagedAttention(nn.Module):
                 value[:num_prompt_tokens],
                 input_metadata,
             )
+        
+        # print("End multi_query_kv_attention!")
+        # torch.cuda.synchronize()
 
         # Wait until the cache op is done.
         if cache_event is not None:
@@ -278,8 +291,12 @@ class PagedAttention(nn.Module):
                 key_to_cache = key_to_cache[input_metadata.to_cache]
                 value_to_cache = value_to_cache[input_metadata.to_cache]
                 slot_mapping = slot_mapping[input_metadata.to_cache]
+            
+            # print("Get slot_mapping!")
+            # torch.cuda.synchronize()
 
             if input_metadata.slot_mapping.ndim == 3:
+                # print("headwise_reshape_and_cache!")
                 cache_ops.headwise_reshape_and_cache(
                     key_to_cache,
                     value_to_cache,
@@ -287,7 +304,10 @@ class PagedAttention(nn.Module):
                     value_cache,
                     slot_mapping,
                 )
+                # print("End headwise_reshape_and_cache!")
+                # torch.cuda.synchronize()
             else:
+                print("reshape_and_cache!")
                 cache_ops.reshape_and_cache(
                     key_to_cache,
                     value_to_cache,
@@ -295,6 +315,8 @@ class PagedAttention(nn.Module):
                     value_cache,
                     slot_mapping,
                 )
+                # print("End reshape_and_cache!")
+                # torch.cuda.synchronize()
 
         if input_metadata.num_generation_tokens > 0:
             # Decoding run.
@@ -313,6 +335,11 @@ class PagedAttention(nn.Module):
                     output[num_prompt_tokens:num_valid_tokens],
                     query[num_prompt_tokens:num_valid_tokens], key_cache,
                     value_cache, input_metadata)
+
+        # print("Get output!")
+        # torch.cuda.synchronize()
+        # output_ = output.cpu()
+        # print(f"Output shape = {output_.shape}")
 
         # Reshape the output tensor.
         # NOTE(woosuk): The output tensor may include paddings.
